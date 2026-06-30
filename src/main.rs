@@ -227,7 +227,7 @@ fn run_batch_mode(
         ));
     };
 
-    // Pre-calculate scale factor (constant across all inputs in batch)
+    // Load schema/query once; scale factor is computed per input.
     let schema_string = opts.read_schema_to_string().transpose()?;
     let query_string = opts.read_query_to_string().transpose()?;
 
@@ -235,8 +235,9 @@ fn run_batch_mode(
     let profile_opts = None;
 
     let mut line_num = 0;
+    let mut processed_count = 0;
     let mut success_count = 0;
-    let mut error_count = 0;
+    let mut failed_count = 0;
 
     for line_result in input_reader.lines() {
         line_num += 1;
@@ -244,10 +245,13 @@ fn run_batch_mode(
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
-                error_count += 1;
+                failed_count += 1;
                 if opts.batch_continue_on_error {
                     eprintln!("Error reading line {}: {}", line_num, e);
-                    println!(r#"{{"success":false,"error":"Error reading input: {}"}}"#, e);
+                    println!(
+                        r#"{{"success":false,"error":"Error reading input: {}"}}"#,
+                        e
+                    );
                     continue;
                 } else {
                     return Err(e.into());
@@ -260,15 +264,13 @@ fn run_batch_mode(
             continue;
         }
 
+        processed_count += 1;
+
         // Parse input
-        let input = match BytesContainer::new(
-            BytesContainerType::Input,
-            codec,
-            line.into_bytes(),
-        ) {
+        let input = match BytesContainer::new(BytesContainerType::Input, codec, line.into_bytes()) {
             Ok(i) => i,
             Err(e) => {
-                error_count += 1;
+                failed_count += 1;
                 if opts.batch_continue_on_error {
                     eprintln!("Error parsing line {}: {}", line_num, e);
                     println!(r#"{{"success":false,"error":"Invalid JSON input: {}"}}"#, e);
@@ -280,31 +282,35 @@ fn run_batch_mode(
         };
 
         // Calculate scale factor for this input
-        let scale_factor = if let (Some(ref schema_string), Some(ref query_string), Some(ref json_value)) =
-            (&schema_string, &query_string, &input.json_value)
-        {
-            match BluejaySchemaAnalyzer::analyze_schema_definition(
-                schema_string,
-                opts.schema_path.as_ref().and_then(|p| p.to_str()),
-                query_string,
-                opts.query_path.as_ref().and_then(|p| p.to_str()),
-                json_value,
-            ) {
-                Ok(sf) => sf,
-                Err(e) => {
-                    error_count += 1;
-                    if opts.batch_continue_on_error {
-                        eprintln!("Error analyzing schema for line {}: {}", line_num, e);
-                        println!(r#"{{"success":false,"error":"Schema analysis failed: {}"}}"#, e);
-                        continue;
-                    } else {
-                        return Err(e);
+        let scale_factor =
+            if let (Some(ref schema_string), Some(ref query_string), Some(ref json_value)) =
+                (&schema_string, &query_string, &input.json_value)
+            {
+                match BluejaySchemaAnalyzer::analyze_schema_definition(
+                    schema_string,
+                    opts.schema_path.as_ref().and_then(|p| p.to_str()),
+                    query_string,
+                    opts.query_path.as_ref().and_then(|p| p.to_str()),
+                    json_value,
+                ) {
+                    Ok(sf) => sf,
+                    Err(e) => {
+                        failed_count += 1;
+                        if opts.batch_continue_on_error {
+                            eprintln!("Error analyzing schema for line {}: {}", line_num, e);
+                            println!(
+                                r#"{{"success":false,"error":"Schema analysis failed: {}"}}"#,
+                                e
+                            );
+                            continue;
+                        } else {
+                            return Err(e);
+                        }
                     }
                 }
-            }
-        } else {
-            DEFAULT_SCALE_FACTOR
-        };
+            } else {
+                DEFAULT_SCALE_FACTOR
+            };
 
         // Run function (reusing engine/module!)
         let result = run(FunctionRunParams {
@@ -320,14 +326,27 @@ fn run_batch_mode(
         // Output result immediately (streaming JSONL - compact format for line-by-line parsing)
         match result {
             Ok(function_result) => {
-                success_count += 1;
+                let function_succeeded = function_result.success;
+                if function_succeeded {
+                    success_count += 1;
+                } else {
+                    failed_count += 1;
+                }
+
                 // Use compact JSON (not pretty-printed) for JSONL format
                 let compact_json = serde_json::to_string(&function_result)
                     .unwrap_or_else(|error| error.to_string());
                 println!("{}", compact_json);
+
+                if !function_succeeded && !opts.batch_continue_on_error {
+                    anyhow::bail!(
+                        "Function execution failed on line {}. Review the logs for more information.",
+                        line_num
+                    );
+                }
             }
             Err(e) => {
-                error_count += 1;
+                failed_count += 1;
                 if opts.batch_continue_on_error {
                     eprintln!("Error executing line {}: {}", line_num, e);
                     println!(r#"{{"success":false,"error":"Execution failed: {}"}}"#, e);
@@ -339,8 +358,10 @@ fn run_batch_mode(
     }
 
     // Log summary to stderr (so it doesn't interfere with JSONL output on stdout)
-    eprintln!("Batch complete: {} inputs processed, {} successful, {} errors",
-              line_num, success_count, error_count);
+    eprintln!(
+        "Batch complete: {} inputs processed, {} successful, {} failed",
+        processed_count, success_count, failed_count
+    );
 
     Ok(())
 }
